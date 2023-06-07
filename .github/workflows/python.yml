@@ -8,6 +8,9 @@ name: python-app
 # exclude yaml files for workflow trigger using path-ignore
 on:
   workflow_dispatch:
+     inputs:
+        name: Mona the Octocat
+        home: San Francisco, CA        
   push:
     branches: [ main ]
     paths-ignore:
