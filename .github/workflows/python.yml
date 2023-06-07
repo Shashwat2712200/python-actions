@@ -1,0 +1,589 @@
+# This workflow will install Python dependencies, run tests and lint with a single version of Python
+# For more information see: https://help.github.com/actions/language-and-framework-guides/using-python-with-github-actions
+
+# name of the workflow
+name: python-app
+
+# conatains details on which branch push/pull-request is being triggered
+# exclude yaml files for workflow trigger using path-ignore
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**/*.yaml'
+  pull_request:
+    branches: [ main ]
+    paths-ignore:
+        - '**/*.yaml'
+        
+# used to modify the default permissions granted to the GITHUB_TOKEN
+permissions:
+  contents: read
+
+# environment variables used in workflow execution
+# ARTIFACTORY: URL, must be provided without http/https
+# REPOSTIORY: repository name
+env:
+  REPOSITORY: images
+  # set intoto to false if you don't want to use it as attestation tool
+  intoto: true
+  # deployment type should be either 'bluegreen' or 'canary' or 'normal'
+  # If not provided or wrong name provided then normal will act as default
+  deployment_type: normal
+
+
+# A workflow-run is made up of one or more jobs
+# It contains 4 jobs: build, dev, qa, prod with execution dependencies
+jobs:
+  build:
+    # Specifying an operating system on which the job will run
+    name: Build the project
+    runs-on: ubuntu-latest
+
+    steps:
+     # Login JIRA using API Token
+    - name: Login Jira
+      id: Login_Jira
+      uses: atlassian/gajira-login@master
+      env:
+        JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}                   # JIRA_BASE_URL: https://jira.atlassian.net/
+        JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}               # JIRA_USER_EMAIL: abc@gmail.com
+        JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}                 # JIRA_API_TOKEN: 2RVknTNh1eDgmA72fzoC2253
+
+    # checkout-code
+    - uses: actions/checkout@v3
+      id: checkout_code
+
+    # Setting up Python
+    - name: Set up Python 3.9
+      id: setup_python
+      uses: actions/setup-python@v3
+      with:
+        python-version: "3.9"
+
+      # Installing dependencies
+    - name: Install dependencies
+      id: install_dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 pytest
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+    
+    - name: copy files
+      if: env.intoto == 'true'
+      run: |
+        cd in-toto
+        ls
+        
+    - name: Create layout file
+      if: env.intoto == 'true'
+      run: python3 in-toto/create_layout.py
+    
+    # Test with pytest
+    - name: Test with pytest
+      id: run_testcases
+      run: |
+        pytest test_app.py 
+    
+    # SonarQube Code Scan
+    - name: SonarQube Scan
+      id: SonarQube_code_scan
+      uses: sonarsource/sonarqube-scan-action@master
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}                         # SONAR_TOKEN: b56aasdaf8b2124bde58eb87979e8f69f123sfbxf8vd
+        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}                   # SONAR_HOST_URL: https://sonarqube.domain.com
+
+    # SonarQube Quality Gate check
+    - name: SonarQube Quality Gate check
+      id: sonarqube_quality_gate_check
+      uses: sonarsource/sonarqube-quality-gate-action@master
+      # Force to fail step after specific time
+      timeout-minutes: 5
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+    # install checkov
+    - name: Install checkov
+      run: pip3 install checkov
+
+    # Run Checkov Action
+    - name: Run Checkov action without in-toto
+      id: checkov
+      if: env.intoto != 'true'
+      run: checkov -d deployments/ -c CKV_K8S_34,CKV_K8S_44,CKV_K8S_45
+    
+    - name: checkov with in-toto
+      if: env.intoto == 'true'
+      run: |
+        export IN_TOTO_LINK_CMD_EXEC_TIMEOUT=''100''
+        in-toto-run --key in-toto/fun1 --materials . --products . --step-name checkov_scan -- checkov -d deployments/ -c CKV_K8S_34,CKV_K8S_44,CKV_K8S_45
+        checkov -d deployments/ -c CKV_K8S_34,CKV_K8S_44,CKV_K8S_45
+
+    # Run Bridgecrew Action
+    - name: Run Bridgecrew 
+      id: Bridgecrew
+      uses: bridgecrewio/bridgecrew-action@master 
+      with:
+        directory: deployments/                                   # IaC root directory to scan
+        api-key: ${{ secrets.BC_API_KEY }}                        # BC_API_KEY: cd09fc64-55d3-4t39-8fj2-xxxxxxxxxxxx
+        quiet: true                                               # display only failed checks
+        soft_fail: true                                           # Runs checks without failing build
+        output_format: sarif                                      # The format of the output - json - cli - sarif
+        container_user: 1000                                      # optional
+
+    - name: Set up Docker 
+      uses: docker/setup-buildx-action@v2
+    
+    - name: Login to Artifactory
+      uses: docker/login-action@v2
+      with:
+        registry: ${{ secrets.DOCKER_URL }} 
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+    
+    - name: Build docker image without in-toto
+      id: build_image
+      if: env.intoto != 'true'
+      run: docker build -t ${{ secrets.DOCKER_URL }}/${{ env.REPOSITORY }}/python-app:${{github.run_number}} .
+
+    - name: Build docker image with in-toto
+      if: env.intoto == 'true'
+      run: |
+        export IN_TOTO_LINK_CMD_EXEC_TIMEOUT=''300''
+        in-toto-run --key in-toto/fun1 --materials . --products . --step-name docker_build -- docker build -t ${{ secrets.DOCKER_URL }}/${{ env.REPOSITORY }}/python-app:${{github.run_number}} .
+        docker build -t ${{ secrets.DOCKER_URL }}/${{ env.REPOSITORY }}/python-app:${{github.run_number}} .
+
+    # # Trivy vulnerability scanner action 
+    - name: Install Trivy
+      run: |
+        sudo apt-get install wget apt-transport-https gnupg lsb-release
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+        echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+        sudo apt-get update
+        sudo apt-get install trivy
+    
+    - name: Run Trivy vulnerability scanner without in-toto
+      id: trivy_scan
+      if: env.intoto != 'true'
+      run: trivy image --exit-code 1 --severity CRITICAL --ignore-unfixed ${{ secrets.DOCKER_URL }}/${{ env.REPOSITORY }}/python-app:${{github.run_number}}                                                                
+    
+    - name: Trivy vulnerability scanner with in-toto
+      if: env.intoto == 'true'
+      run: |
+        export IN_TOTO_LINK_CMD_EXEC_TIMEOUT=''300''
+        in-toto-run --key in-toto/fun1 --materials . --products . --step-name trivy_scan -- trivy image --exit-code 1 --severity CRITICAL --ignore-unfixed ${{ secrets.DOCKER_URL }}/${{ env.REPOSITORY }}/python-app:${{github.run_number}}
+        trivy image --exit-code 1 --severity CRITICAL --ignore-unfixed ${{ secrets.DOCKER_URL }}/${{ env.REPOSITORY }}/python-app:${{github.run_number}} 
+
+    - name: Run Grype vulnerability scanner
+      id: grype_scan
+      uses: anchore/scan-action@v3
+      with:
+        image: "${{ secrets.DOCKER_URL }}/${{ env.REPOSITORY }}/python-app:${{github.run_number}}"
+        fail-build: true
+        output-format: "table"
+        severity-cutoff: critical
+
+    # Run Snyk test to check Docker image for vulnerabilities
+    # ARTIFACTORY: https://imagerepo.jfrog.io/
+    # REPOSITORY: images   (repository name)
+    - name: Run Snyk to check Docker image for vulnerabilities          # action name
+      id: run_snyk                                                      # action id
+      uses: snyk/actions/docker@master                                  
+      continue-on-error: false                                           # continue-on-error: whether continu eor not on error
+      env:                                                              # environment variables
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}                           # snyk pat token
+      with:
+        image: ${{ secrets.DOCKER_URL }}/${{ env.REPOSITORY }}/python-app:${{github.run_number}}  # image: artifactory.io/repo/img:tag
+        args: --json-file-output=snyk.json                                                      # arguments
+
+      # convert json file to html format for snyk report
+    - name: json to html report
+      id: snyk_results_json_to_html                         # install snyk-to-html package # generate snyk html
+      run: |
+        npm install snyk-to-html -g                               
+        snyk-to-html -i snyk.json -o results.html                 
+  
+  # upload snyk report as artifact for results
+    - uses: actions/upload-artifact@v3
+      id: upload_artifact
+      with:
+        name: snyk_results
+        path: results.html
+
+    - name:  Docker image push to Artifactory without in-toto
+      id: push_image
+      if: env.intoto != 'true'
+      run: docker push ${{ secrets.DOCKER_URL }}/${{ env.REPOSITORY }}/python-app:${{github.run_number}}  
+
+    - name: Docker image push to Artifactory with in-toto
+      if: env.intoto == 'true'
+      run: |
+        export IN_TOTO_LINK_CMD_EXEC_TIMEOUT=''300''
+        in-toto-run --key in-toto/fun2 --materials . --products . --step-name docker_push -- docker push ${{ secrets.DOCKER_URL }}/${{ env.REPOSITORY }}/python-app:${{github.run_number}} 
+        docker push ${{ secrets.DOCKER_URL }}/${{ env.REPOSITORY }}/python-app:${{github.run_number}}
+        
+    - name: Verify with in-toto
+      if: env.intoto == 'true'
+      run: in-toto-verify --layout-key in-toto/own.pub --layout root.layout
+
+    # Creating JIRA Tickets for failed tasks
+    # github.repository: github_reposiotry_name (pre-defined variable)
+    # project: ID of the project in JIRA
+    # issuetype: Bug, Task, Story, etc
+    - name: Create ticket in jira
+      id: create_jira_ticket
+      uses: atlassian/gajira-create@master
+      if: failure()
+      with:
+        project: DEV
+        issuetype: Bug
+        summary: |
+          Build Failed for Repository: ${{ github.repository }} Env: Prod
+        description: |
+          Build failed for ${{ github.repository }}. Please find the details below:
+          ${{ toJson(steps) }}
+    
+  DeployDev:
+    # name of stage
+    name: Deploy to Dev
+    needs: [build]
+    # Specifying an operating system on which the job will run
+    runs-on: ubuntu-latest
+    steps:
+      # checkout-code
+      - uses: actions/checkout@v3
+        id: checkout_code
+
+      # Login JIRA using API Token
+      - name: Login Jira
+        id: Login_Jira
+        uses: atlassian/gajira-login@master
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}                   # JIRA_BASE_URL: https://jira.atlassian.net/
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}               # JIRA_USER_EMAIL: abc@gmail.com
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}                 # JIRA_API_TOKEN: 2RVknTNh1eDgmA72fqweqzoC2253
+
+      # update dev deployment.yaml file
+      # ARTIFACTORY: https://imagerepo.jfrog.io/
+      # REPOSITORY: images   (repository name)
+      - name: Update deployments/dev/deploy.yaml
+        id: update_build_number_in_dev
+        if: (env.deployment_type != 'canary') && (env.deployment_type != 'bluegreen')
+        uses: fjogeleit/yaml-update-action@main                                                   
+        with:
+          valueFile: 'deployments/dev/deployment.yaml'                                              # relative path from the Workspace Directory
+          propertyPath: 'spec.template.spec.containers[0].image'                                    # PropertyPath for the new value, JSONPath supported
+          value: ${{ secrets.DOCKER_URL }}/${{ env.REPOSITORY }}/python-app:${{github.run_number}}  # New value for the related PropertyPath; jfrog.io/repo/image:tag
+          commitChange: true                                                                        # Commit the change to branch with the given message; true | false
+          updateFile: true                                                                          # By default the actual file is not updated, to do so set this property to 'true
+          targetBranch: main                                                                        # Opens a PR from branch to targetBranch if createPR is set to 'true'
+          branch: main                                                                              # The updated YAML file will be commited to this branch, branch will be created if not exists
+          token: ${{ secrets.TOKEN }}                                                               # github pat token
+      - name: Update deployments/dev/deploy.yaml
+        id: update_build_number_in_bluegreen_dev
+        uses: fjogeleit/yaml-update-action@main    
+        if: env.deployment_type == 'bluegreen'                                               
+        with:
+          valueFile: 'bluegreen-deployments/dev/deployment.yaml'                                    # relative path from the Workspace Directory
+          propertyPath: 'spec.template.spec.containers[0].image'                                    # PropertyPath for the new value, JSONPath supported
+          value: ${{ secrets.DOCKER_URL }}/${{ env.REPOSITORY }}/python-app:${{github.run_number}}  # New value for the related PropertyPath; jfrog.io/repo/image:tag
+          commitChange: true                                                                        # Commit the change to branch with the given message; true | false
+          updateFile: true                                                                          # By default the actual file is not updated, to do so set this property to 'true
+          targetBranch: main                                                                        # Opens a PR from branch to targetBranch if createPR is set to 'true'
+          branch: main                                                                              # The updated YAML file will be commited to this branch, branch will be created if not exists
+          token: ${{ secrets.TOKEN }}                                                               # github pat token
+      
+      - name: Update deployments/dev/deploy.yaml
+        id: update_build_number_in_canary_dev
+        uses: fjogeleit/yaml-update-action@main    
+        if: env.deployment_type == 'canary'                                               
+        with:
+          valueFile: 'canary-deployments/dev/deployment.yaml'                                       # relative path from the Workspace Directory
+          propertyPath: 'spec.template.spec.containers[0].image'                                    # PropertyPath for the new value, JSONPath supported
+          value: ${{ secrets.DOCKER_URL }}/${{ env.REPOSITORY }}/python-app:${{github.run_number}}  # New value for the related PropertyPath; jfrog.io/repo/image:tag
+          commitChange: true                                                                        # Commit the change to branch with the given message; true | false
+          updateFile: true                                                                          # By default the actual file is not updated, to do so set this property to 'true
+          targetBranch: main                                                                        # Opens a PR from branch to targetBranch if createPR is set to 'true'
+          branch: main                                                                              # The updated YAML file will be commited to this branch, branch will be created if not exists
+          token: ${{ secrets.TOKEN }}                                                               # github pat token
+      
+      # Creating JIRA Tickets for failed tasks
+      # github.repository: github_reposiotry_name (pre-defined variable)
+      # project: ID of the project in JIRA
+      # issuetype: Bug, Task, Story, etc
+      - name: Create ticket in jira
+        id: create_jira_ticket
+        uses: atlassian/gajira-create@master
+        if: failure()
+        with:
+          project: DEV
+          issuetype: Bug
+          summary: |
+            Build Failed for Repository: ${{ github.repository }} and ENV: Dev
+          description: |
+            Build failed for ${{ github.repository }}. Please find the details below:
+            ${{ toJson(steps) }}
+      
+      # giving executable permission to sendgrid.js
+      # sendgrid.js: javascript file used for metadata
+      - name: change mode
+        id: change_permission_sendgrid 
+        if: always()
+        run: chmod +x sendgrid.js
+      
+      # SendGrid Mail-send Action
+      # sendgrid.js: javascript file used for metadata
+      - name: SendGrid
+        id: send_mail 
+        if: always()
+        uses: peter-evans/sendgrid-action@v1
+        env:
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}         # env: SENDGRID_API_KEY: apikey
+          STEPS_STATUS: ${{ toJson(steps) }}                        # env: all steps staus to be sent
+          REPOSITORY: ${{ github.repository }}                      # environment var: github repository
+          SCRIPT_FILEPATH: ./sendgrid.js                            # sendgrid script
+      
+      # ArgoCD sync with dev deployment.yaml
+      - name: ArgoCD Sync Action
+        # You may pin to the exact commit or the version.
+        # uses: safe2008/argocd-app-actions@9f5573186b52fdd0a1d03c7f9d6e9bd7e49be1f1
+        uses: safe2008/argocd-app-actions@v0.2.0
+        id: argocd_sync_dev_env
+        with:
+          # ArgoCD server address without http/https
+          address: ${{ secrets.ARGOCD_ADDRESS }}
+          # ArgoCD token
+          token:  ${{ secrets.ARGOCD_TOKEN }}
+          # insecure : if it is not secure
+          insecure: true
+          # Application name to sync
+          appName: "python-dev"
+
+  DeployQA:
+    # stage name
+    name: Deploy to QA
+    needs: [DeployDev]
+    # Specifying an operating system on which the job will run
+    runs-on: ubuntu-latest
+    steps:
+      # checkout-code
+      - uses: actions/checkout@v3
+        id: checkout_code
+      
+      # Login JIRA
+      - name: Login Jira
+        id: Login_Jira
+        uses: atlassian/gajira-login@master
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}                           # JIRA_BASE_URL: https://jira.atlassian.net/
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}                       # JIRA_USER_EMAIL: abc@gmail.com
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}                         # JIRA_API_TOKEN: 2RVknTNh1eDgmA72fzoC2253
+      
+      # Start Invicti Enterprise Scan
+      - name: Start Netsparker Enterprise Scan
+        id: netsparker-enterprise-scan-step
+        uses: netsparker/Netsparker-Cloud-GitHub-Actions@v0.0.1
+        with:
+          website-id: ${{ secrets.NETSPARKER_WEBSITE_ID }} # Unique Id for your website on Netsparker Enterprise.
+          scan-type: 'FullWithSelectedProfile'            # Requested scan type for scan.
+          profile-id: ${{ secrets.NETSPARKER_PROFILE_ID }} #  Unique profile Id for your requested website scan profile on Netsparker Enterprise.
+          user-id: ${{ secrets.NETSPARKER_USER_ID}}           # User Id on Netsparker Enterprise API Credentials. Use GitHub Secrets.
+          api-token: ${{ secrets.NETSPARKER_API_TOKEN}} # API Token on Netsparker Enterprise API Credentials
+          base-url: 'https://www.netsparkercloud.com'          # Website URL for Netsparker Enterprise.
+      
+      # Displays output for Netsparker website scanaction
+      - name: Display Scan Request Message
+        id: display_netsparkar_scan_details
+        run: echo "${{ steps.netsparker-enterprise-scan-step.outputs.scan-message }}"
+
+      # update qa deployment.yaml file
+      # ARTIFACTORY: https://imagerepo.jfrog.io/
+      # REPOSITORY: images   (repository name)
+      - name: Update deployments/qa/deploy.yaml
+        uses: fjogeleit/yaml-update-action@main
+        id: update_build_number_in_qa
+        if: (env.deployment_type != 'canary') && (env.deployment_type != 'bluegreen')
+        with:
+          valueFile: 'deployments/qa/deployment.yaml'                                                   # FilePath to be edited
+          propertyPath: 'spec.template.spec.containers[0].image'                                        # PropertyPath for the new value, JSONPath supported
+          value: ${{ secrets.DOCKER_URL }}/${{ env.REPOSITORY }}/python-app:${{github.run_number}}      # New value for the related PropertyPath; jfrog.io/repo/image:tag
+          commitChange: true                                                                            # Commit the change to branch with the given message; true | false
+          updateFile: true                                                                              # By default the actual file is not updated, to do so set this property to 'true
+          targetBranch: main                                                                            # Opens a PR from branch to targetBranch if createPR is set to 'true', same put it as same branch
+          branch: main                                                                                  # The updated YAML file will be commited to this branch, branch will be created if not exists
+          token: ${{ secrets.TOKEN }}                                                                   # github pat token
+      
+      - name: Update deployments/qa/deploy.yaml
+        uses: fjogeleit/yaml-update-action@main
+        id: update_build_number_in_bluegreen_qa
+        if: env.deployment_type == 'bluegreen'
+        with:
+          valueFile: 'bluegreen-deployments/qa/deployment.yaml'                                         # FilePath to be edited
+          propertyPath: 'spec.template.spec.containers[0].image'                                        # PropertyPath for the new value, JSONPath supported
+          value: ${{ secrets.DOCKER_URL }}/${{ env.REPOSITORY }}/python-app:${{github.run_number}}      # New value for the related PropertyPath; jfrog.io/repo/image:tag
+          commitChange: true                                                                            # Commit the change to branch with the given message; true | false
+          updateFile: true                                                                              # By default the actual file is not updated, to do so set this property to 'true
+          targetBranch: main                                                                            # Opens a PR from branch to targetBranch if createPR is set to 'true', same put it as same branch
+          branch: main                                                                                  # The updated YAML file will be commited to this branch, branch will be created if not exists
+          token: ${{ secrets.TOKEN }}                                                                   # github pat token
+      
+      - name: Update deployments/qa/deploy.yaml
+        uses: fjogeleit/yaml-update-action@main
+        id: update_build_number_in_canary_qa
+        if: env.deployment_type == 'canary'
+        with:
+          valueFile: 'canary-deployments/qa/deployment.yaml'                                            # FilePath to be edited
+          propertyPath: 'spec.template.spec.containers[0].image'                                        # PropertyPath for the new value, JSONPath supported
+          value: ${{ secrets.DOCKER_URL }}/${{ env.REPOSITORY }}/python-app:${{github.run_number}}      # New value for the related PropertyPath; jfrog.io/repo/image:tag
+          commitChange: true                                                                            # Commit the change to branch with the given message; true | false
+          updateFile: true                                                                              # By default the actual file is not updated, to do so set this property to 'true
+          targetBranch: main                                                                            # Opens a PR from branch to targetBranch if createPR is set to 'true', same put it as same branch
+          branch: main                                                                                  # The updated YAML file will be commited to this branch, branch will be created if not exists
+          token: ${{ secrets.TOKEN }}                                                                   # github pat token
+
+    # Creating JIRA Tickets for failed tasks
+    # github.repository: github_reposiotry_name (pre-defined variable)
+    # project: ID of the project in JIRA
+    # issuetype: Bug, Task, Story, etc
+      - name: Create ticket in jira
+        id: create_jira_ticket
+        uses: atlassian/gajira-create@master
+        if: failure()
+        with:
+          project: DEV
+          issuetype: Bug
+          summary: |
+            Build Failed for Repository: ${{ github.repository }} Env: QA 
+          description: |
+            Build failed for ${{ github.repository }}. Please find the details below:
+            ${{ toJson(steps) }}
+      
+      # giving executable permission to sendgrid.js
+      # sendgrid.js: javascript file used for metadata
+      - name: change mode
+        if: always()
+        id: change_permission_sendgrid 
+        run: chmod +x sendgrid.js
+
+      # SendGrid Mail-send Action
+      # sendgrid.js: javascript file used for metadata
+      - name: SendGrid
+        if: always()
+        id: send_mail
+        uses: peter-evans/sendgrid-action@v1
+        env:
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}                # SENDGRID_API_KEY: SG.Gh7fHzErTXWgKvoswwnmmA.sNDPco2tiAUXbUjyxU0o0qJLaVJ9kJdYR3kpOA
+          STEPS_STATUS: ${{ toJson(steps) }}                               # steps status to be sent
+          REPOSITORY: ${{ github.repository }}                             # github reposirtory sent in mail body
+          SCRIPT_FILEPATH: ./sendgrid.js                                   # sendgrid script path
+
+      # ArgoCD sync with qa deployment.yaml
+      - name: ArgoCD Sync Action
+        id: argocd_sync_qa_env
+        # You may pin to the exact commit or the version.
+        # uses: safe2008/argocd-app-actions@9f5573186b52fdd0a1d03c7f9d6e9bd7e49be1f1
+        uses: safe2008/argocd-app-actions@v0.2.0
+        with:
+          # ArgoCD server address
+          address: ${{ secrets.ARGOCD_ADDRESS }}
+          # ArgoCD token
+          token:  ${{ secrets.ARGOCD_TOKEN }}
+          # insecure
+          insecure: true
+          # Application name to sync
+          appName: "python-qa"
+           
+  DeployProd:
+    name: Deploy to Prod
+    needs: [DeployQA]
+    runs-on: ubuntu-latest
+    steps:
+      # checkout-code
+      - uses: actions/checkout@v3
+        id: checkout_code
+      #  Login JIRA
+      - name: Login Jira
+        id: Login_Jira
+        uses: atlassian/gajira-login@master
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}                           # JIRA_BASE_URL: https://jira.atlassian.net/
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}                       # JIRA_USER_EMAIL: abc@gmail.com
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}                         # JIRA_API_TOKEN: 2RVknTNh1eDgmA72fzoC2253
+  
+      # update prod deployment.yaml file
+      # ARTIFACTORY: https://imagerepo.jfrog.io/
+      # REPOSITORY: images   (repository name)
+      - name: Update deployments/prod/deploy.yaml
+        uses: fjogeleit/yaml-update-action@main
+        id: update_build_number_in_prod
+        if: (env.deployment_type != 'canary') && (env.deployment_type != 'bluegreen')
+        with:
+          valueFile: 'deployments/prod/deployment.yaml'                                             # FilePath to be edited                                             
+          propertyPath: 'spec.template.spec.containers[0].image'                                    # PropertyPath for the new value, JSONPath supported
+          value: ${{ secrets.DOCKER_URL }}/${{ env.REPOSITORY }}/python-app:${{github.run_number}}  # New value for the related PropertyPath; jfrog.io/repo/image:tag
+          commitChange: true                                                                        # Commit the change to branch with the given message; true | false
+          updateFile: true                                                                          # By default the actual file is not updated, to do so set this property to 'true
+          targetBranch: main                                                                        # Opens a PR from branch to targetBranch if createPR is set to 'true', same put it as same branch
+          branch: main                                                                              # The updated YAML file will be commited to this branch, branch will be created if not exists
+          token: ${{ secrets.TOKEN }}                                                               # github pat token
+      
+      - name: Update deployments/prod/deploy.yaml
+        uses: fjogeleit/yaml-update-action@main
+        id: update_build_number_in_bluegreen_prod
+        if: env.deployment_type == 'bluegreen'
+        with:
+          valueFile: 'bluegreen-deployments/prod/deployment.yaml'                                   # FilePath to be edited                                             
+          propertyPath: 'spec.template.spec.containers[0].image'                                    # PropertyPath for the new value, JSONPath supported
+          value: ${{ secrets.DOCKER_URL }}/${{ env.REPOSITORY }}/python-app:${{github.run_number}}  # New value for the related PropertyPath; jfrog.io/repo/image:tag
+          commitChange: true                                                                        # Commit the change to branch with the given message; true | false
+          updateFile: true                                                                          # By default the actual file is not updated, to do so set this property to 'true
+          targetBranch: main                                                                        # Opens a PR from branch to targetBranch if createPR is set to 'true', same put it as same branch
+          branch: main                                                                              # The updated YAML file will be commited to this branch, branch will be created if not exists
+          token: ${{ secrets.TOKEN }}                                                               # github pat token
+      
+      - name: Update deployments/prod/deploy.yaml
+        uses: fjogeleit/yaml-update-action@main
+        id: update_build_number_in_canary_prod
+        if: env.deployment_type == 'canary'
+        with:
+          valueFile: 'canary-deployments/prod/deployment.yaml'                                      # FilePath to be edited                                             
+          propertyPath: 'spec.template.spec.containers[0].image'                                    # PropertyPath for the new value, JSONPath supported
+          value: ${{ secrets.DOCKER_URL }}/${{ env.REPOSITORY }}/python-app:${{github.run_number}}  # New value for the related PropertyPath; jfrog.io/repo/image:tag
+          commitChange: true                                                                        # Commit the change to branch with the given message; true | false
+          updateFile: true                                                                          # By default the actual file is not updated, to do so set this property to 'true
+          targetBranch: main                                                                        # Opens a PR from branch to targetBranch if createPR is set to 'true', same put it as same branch
+          branch: main                                                                              # The updated YAML file will be commited to this branch, branch will be created if not exists
+          token: ${{ secrets.TOKEN }}                                                               # github pat token
+
+    # Creating JIRA Tickets for failed tasks
+    # github.repository: github_reposiotry_name (pre-defined variable)
+    # project: ID of the project in JIRA
+    # issuetype: Bug, Task, Story, etc
+      - name: Create ticket in jira
+        uses: atlassian/gajira-create@master
+        if: failure()
+        with:
+          project: DEV
+          issuetype: Bug
+          summary: |
+            Build Failed for Repository: ${{ github.repository }} Env: Prod
+          description: |
+            Build failed for ${{ github.repository }}. Please find the details below:
+            ${{ toJson(steps) }}
+      
+      # giving executable permission to sendgrid.js
+      # sendgrid.js: javascript file used for metadata
+      - name: change mode
+        if: always()
+        run: chmod +x sendgrid.js
+      
+      # SendGrid Mail-send Action
+      # sendgrid.js: javascript file used for metadata
+      - name: SendGrid
+        if: always()
+        uses: peter-evans/sendgrid-action@v1
+        env:
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}                # SENDGRID_API_KEY: SG.Gh7fHzErTXWgKvoswwnmmA.sNDPco2tiAUXbUjyxU0o0qJLaVJ9kJdYR3kpOA
+          STEPS_STATUS: ${{ toJson(steps) }}                               # steps status to be sent
+          REPOSITORY: ${{ github.repository }}                             # github reposirtory sent in mail body
+          SCRIPT_FILEPATH: ./sendgrid.js                                   # sendgrid script path

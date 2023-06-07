@@ -1,0 +1,4 @@
+# ignore deploymnt file changes
+dev/*.yaml
+qa/*.yaml
+prod/*.yaml

@@ -1,0 +1,12 @@
+kind: Service
+apiVersion: v1
+metadata:
+  name: pythondemo
+spec:
+  type: ClusterIP
+  selector:
+    app: pythondemo
+    tier: frontend
+  ports:
+  - port: 8080
+    targetPort: 8080

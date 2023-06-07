@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pythondemo
+  labels:
+    app: pythondemo
+    tier: frontend
+    kube-monkey/enabled: "enabled"              # Enable termination of this deployment
+    kube-monkey/identifier:  "pythondemo"    # Custom name for our target
+    kube-monkey/mtbf: "1"                       # Average number of days between targeting one of these pods
+    kube-monkey/kill-mode: "fixed" # The killing method
+    kube-monkey/kill-value: "1"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pythondemo
+  template:
+    metadata:
+      labels:
+        app: pythondemo
+        tier: frontend
+        kube-monkey/enabled: "enabled"              # Enable termination of this deployment
+        kube-monkey/identifier:  "pythondemo"
+    spec:
+      containers:
+        - name: python
+          image: abc.jfrog.io/images/python-app:13
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+      imagePullSecrets:
+        - name: argocd-cred
+      nodeSelector:
+        kubernetes.io/os: linux

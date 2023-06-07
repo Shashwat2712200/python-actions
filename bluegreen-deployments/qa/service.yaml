@@ -1,0 +1,27 @@
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: activeservice
+spec:
+  type: ClusterIP
+  selector:
+    app: pythondemo
+    tier: frontend
+  ports:
+  - port: 80
+    targetPort: 80
+    
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: previewservice
+spec:
+  type: ClusterIP
+  selector:
+    app: pythondemo
+    tier: frontend
+  ports:
+  - port: 80
+    targetPort: 80
