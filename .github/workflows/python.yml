@@ -7,6 +7,7 @@ name: python-app
 # conatains details on which branch push/pull-request is being triggered
 # exclude yaml files for workflow trigger using path-ignore
 on:
+  workflow_dispatch:
   push:
     branches: [ main ]
     paths-ignore:
