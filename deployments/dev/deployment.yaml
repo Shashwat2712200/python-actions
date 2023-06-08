@@ -25,7 +25,7 @@ spec:
     spec:
       containers:
         - name: python
-          image: abc.jfrog.io/images/python-app:13
+          image: zcx.jfrog.io/images/javascript-app:6
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
